@@ -85,8 +85,26 @@ STAGE_WAIT_ADMIN = 3      # 等待管理员（任务二前）
 STAGE_FINISHED = 4        # 全部完成
 
 # 语音确认关键词
-CONFIRM_KEYWORDS_TASK1 = ["去深圳馆", "参观深圳馆", "带我去参观", "带我去深圳馆", "好的", "确认", "去", "是"]
+CONFIRM_KEYWORDS_TASK1 = ["去", "带我去", "参观", "带我去参观", "好的", "确认", "是"]
 CONFIRM_KEYWORDS_TASK2 = ["开始巡检", "开始执行巡检", "执行巡检", "开始检查", "好的", "确认", "是"]
+
+# 场馆语音识别关键词映射（用户说"去北京馆"→识别为北京馆）
+VENUE_KEYWORDS = {
+    "北京馆": ["北京馆", "北京"],
+    "上海馆": ["上海馆", "上海"],
+    "吉林馆": ["吉林馆", "吉林"],
+    "深圳馆": ["深圳馆", "深圳"],
+    "广州馆": ["广州馆", "广州"],
+}
+
+# 场馆中文名转拼音映射（用于构造guide/back音频文件名）
+PINYIN_MAP = {
+    "北京馆": "beijing",
+    "上海馆": "shanghai",
+    "吉林馆": "jilin",
+    "深圳馆": "shenzhen",
+    "广州馆": "guangzhou",
+}
 
 
 # ==================== 客户端初始化 ====================
@@ -163,24 +181,37 @@ rospy.loginfo(f"YOLO模型已加载: {YOLO_MODEL_PATH}")
 
 # ==================== 功能函数 ====================
 
+def get_pcm_duration(file_path, sample_rate=16000, channels=1, sample_width=2):
+    """
+    根据PCM文件大小计算音频时长（秒）
+    默认参数：16kHz 单声道 16-bit（标准TTS输出格式）
+    返回时长，若文件不存在返回0
+    """
+    if not file_path or not os.path.exists(file_path):
+        return 0
+    size = os.path.getsize(file_path)
+    return size / (sample_rate * channels * sample_width)
+
+
 def playAudio(file_path):
-    """使用PCM播放器播放音频文件"""
+    """使用PCM播放器播放音频文件，返回估算时长（秒）"""
     if not file_path or not os.path.exists(file_path):
         rospy.logwarn(f"音频不存在: {file_path}")
-        return False
+        return 0
     try:
         msg = REIPlayerRequest()
         msg.PcmPath = file_path
         resp = player_client.call(msg)
         if resp.success:
-            rospy.loginfo(f"[音频] 播放: {os.path.basename(file_path)}")
-            return True
+            duration = get_pcm_duration(file_path)
+            rospy.loginfo(f"[音频] 播放: {os.path.basename(file_path)} (~{duration:.1f}秒)")
+            return duration
         else:
             rospy.logwarn(f"[音频] 失败: {resp.message}")
-            return False
+            return 0
     except Exception as e:
         rospy.logwarn(f"[音频] 异常: {e}")
-        return False
+        return 0
 
 
 def face_detect():
@@ -199,7 +230,7 @@ def face_detect():
     return labels
 
 
-def wait_for_voice_confirm(timeout_sec=60, keywords=None):
+def wait_for_voice_confirm(timeout_sec=60, keywords=None, detect_venue=False):
     """
     等待用户通过语音确认。
     用户需要说"元宝元宝"唤醒，然后说出匹配关键词。
@@ -211,7 +242,11 @@ def wait_for_voice_confirm(timeout_sec=60, keywords=None):
       REIResultNlp[] intent  # NLP意图列表，每个有 .query 字段
       string anwser
 
-    返回 True 表示确认，False 表示超时。
+    参数：
+      detect_venue: 是否同时检测场馆名称（任务一用）
+    
+    返回：detect_venue=True时返回 (confirmed, venue_name)
+          detect_venue=False时返回 True/False
     参考 voice_navgoal.py 的 voiceResult_cb 逻辑。
     """
     global _voice_result
@@ -220,7 +255,8 @@ def wait_for_voice_confirm(timeout_sec=60, keywords=None):
 
     rospy.loginfo("=" * 40)
     rospy.loginfo("[确认] 等待语音确认...")
-    rospy.loginfo(f"[确认] 请说: 元宝元宝 -> {keywords[0]}")
+    hint = "去XXX馆" if keywords is CONFIRM_KEYWORDS_TASK1 else "开始巡检"
+    rospy.loginfo(f"[确认] 请说: 元宝元宝 -> {hint}")
     rospy.loginfo(f"[确认] 超时: {timeout_sec}秒")
     rospy.loginfo("=" * 40)
 
@@ -256,6 +292,19 @@ def wait_for_voice_confirm(timeout_sec=60, keywords=None):
 
             # 在文本中匹配关键词
             if text:
+                # 如果开启了场馆检测，先尝试匹配场馆名称
+                venue_name = None
+                if detect_venue:
+                    for venue, venue_keys in VENUE_KEYWORDS.items():
+                        for vk in venue_keys:
+                            if vk in text:
+                                venue_name = venue
+                                rospy.loginfo(f"[确认] 检测到场馆: {venue_name}")
+                                break
+                        if venue_name:
+                            break
+
+                # 匹配通用确认关键词
                 for keyword in keywords:
                     if keyword in text:
                         rospy.loginfo(f"[确认] 匹配到关键词 \"{keyword}\" → 确认成功！")
@@ -263,6 +312,8 @@ def wait_for_voice_confirm(timeout_sec=60, keywords=None):
                             record_audio_client.call(SetBoolRequest(False))
                         except:
                             pass
+                        if detect_venue:
+                            return (True, venue_name)  # venue_name可能为None
                         return True
 
         rate.sleep()
@@ -273,6 +324,8 @@ def wait_for_voice_confirm(timeout_sec=60, keywords=None):
     except:
         pass
     rospy.logwarn(f"[确认] 超时！共收到{msg_count}条消息，未匹配关键词")
+    if detect_venue:
+        return (False, None)
     return False
 
 
@@ -454,7 +507,7 @@ def nav_to_goal(goal_name, max_retries=2):
 
 
 def do_task1():
-    """任务一：迎宾引导 - 深圳馆（需语音确认）"""
+    """任务一：迎宾引导 - 支持5个场馆（需语音确认用户想去哪个馆）"""
     rospy.loginfo("=" * 50)
     rospy.loginfo(">>> 开始执行任务一：迎宾引导 <<<")
     rospy.loginfo("=" * 50)
@@ -467,53 +520,73 @@ def do_task1():
     except:
         pass
     time.sleep(0.2)
-    playAudio(audio["awake"])
-    time.sleep(1)
+    dur = playAudio(audio["awake"])
+    time.sleep(dur + 0.3)  # 等音频播完
 
-    # 2. 【等待用户语音确认】用户说"带我去深圳馆/参观深圳馆"等关键词
-    confirmed = wait_for_voice_confirm(timeout_sec=60)
+    # 2. 【等待用户语音确认】检测用户想去哪个场馆
+    confirmed, venue_name = wait_for_voice_confirm(timeout_sec=60, detect_venue=True)
 
     if not confirmed:
-        rospy.logwarn("[任务一] 未收到确认，等待中...")
-        # 再等一轮
-        confirmed = wait_for_voice_confirm(timeout_sec=60)
+        rospy.logwarn("[任务一] 未收到确认，再等一轮...")
+        confirmed, venue_name = wait_for_voice_confirm(timeout_sec=60, detect_venue=True)
 
-    # 3. 用户确认后，停止录音 → 播放欢迎语 + 引导介绍
+    if not confirmed:
+        rospy.logerr("[任务一] 用户多次未确认，取消任务")
+        return
+
+    # 如果检测到具体场馆名则使用，否则默认深圳馆
+    if venue_name is None:
+        venue_name = "深圳馆"
+        rospy.logwarn(f"[任务一] 未检测到具体场馆，默认前往 {venue_name}")
+
+    rospy.loginfo(f"[任务一] 用户确认 → 前往 {venue_name}")
+
+    # 3. 用户确认后，停止录音 → 播放欢迎语 → 等待播完 → 再播放场馆引导介绍
     try:
         record_audio_client.call(SetBoolRequest(False))
     except:
         pass
     time.sleep(0.2)
-    playAudio(audio["talk"])
-    time.sleep(1)
-    playAudio(audio["guide"])
-    time.sleep(1)
+    dur = playAudio(audio["talk"])  # talk1.pcm 通用欢迎语（~2.2s）
+    time.sleep(dur + 0.3)  # 确保talk1完全播完再播guide
 
-    # 恢复录音
-    try:
-        record_audio_client.call(SetBoolRequest(True))
-    except:
-        pass
+    # 播放场馆引导音频 guide_{pinyin}.pcm（预留接口，用户后续补充pcm文件）
+    venue_pinyin = PINYIN_MAP.get(venue_name, "shenzhen")
+    guide_path = os.path.join(AUDIO_DIR, f"guide_{venue_pinyin}.pcm")
+    if os.path.exists(guide_path):
+        dur = playAudio(guide_path)
+        time.sleep(dur + 0.3)  # 等guide音频播完
+    else:
+        rospy.logwarn(f"[任务一] guide_{venue_pinyin}.pcm 不存在，跳过引导（预留接口，请后续补充）")
 
-    # 4. 导航前往深圳馆
-    rospy.loginfo("[任务一] 开始导航前往深圳馆...")
-    success = nav_to_goal("深圳馆")
+    # 注意：导航期间不恢复录音！
+    # 避免云端AIUI在导航过程中生成无关TTS应答（如"去厨房"）排队覆盖back_xxx.pcm
+    # 深圳馆因guide_shenzhen.pcm时长14s足够让TTS过期，其他馆无此缓冲必须禁用
 
-    # 5. 到达后播报
+    # 4. 导航前往目标场馆（使用过冲+回退策略的精确模式）
+    rospy.loginfo(f"[任务一] 开始导航前往 {venue_name}...")
+    success = nav_to_goal(venue_name)
+
+    # 5. 到达后播报 back_{pinyin}.pcm（预留接口）
     if success:
         try:
             record_audio_client.call(SetBoolRequest(False))
         except:
             pass
         time.sleep(0.2)
-        playAudio(audio["arrived"])
-        time.sleep(2)
+        back_path = os.path.join(AUDIO_DIR, f"back_{venue_pinyin}.pcm")
+        if os.path.exists(back_path):
+            dur = playAudio(back_path)
+            time.sleep(dur + 0.3)  # 等back音频播完
+        else:
+            rospy.logwarn(f"[任务一] back_{venue_pinyin}.pcm 不存在，跳过到达播报（预留接口，请后续补充）")
+        time.sleep(0.5)
         try:
             record_audio_client.call(SetBoolRequest(True))
         except:
             pass
     else:
-        rospy.logwarn("[任务一] 导航到深圳馆失败，尝试继续...")
+        rospy.logwarn(f"[任务一] 导航到{venue_name}失败，尝试继续...")
 
     # 6. 返回原点
     rospy.loginfo("[任务一] 导航返回原点...")
@@ -615,8 +688,8 @@ def do_task2():
     except:
         pass
     time.sleep(0.2)
-    playAudio(audio["awake"])
-    time.sleep(1)
+    dur = playAudio(audio["awake"])
+    time.sleep(dur + 0.3)  # 等音频播完
 
     # 2. 等待用户语音确认
     confirmed = wait_for_voice_confirm(timeout_sec=60, keywords=CONFIRM_KEYWORDS_TASK2)
@@ -631,11 +704,9 @@ def do_task2():
     except:
         pass
     time.sleep(0.2)
-    playAudio(audio["talk"])
-    # 等待音频播放完成（talk2.pcm通常3-5秒，给足时间）
-    audio_wait_time = 5
-    rospy.loginfo(f"[任务二] 等待{audio_wait_time}秒确保音频播放完成...")
-    time.sleep(audio_wait_time)
+    dur = playAudio(audio["talk"])  # talk2.pcm (~2.8s)
+    rospy.loginfo(f"[任务二] 等待{dur:.1f}秒确保音频播放完成...")
+    time.sleep(dur + 0.3)
 
     # 4. 发布巡检开始指令
     patrol_pub.publish(String(data="start_patrol"))
