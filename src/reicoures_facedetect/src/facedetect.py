@@ -13,6 +13,7 @@ import rospy
 import time
 import os
 import sys
+import subprocess
 import actionlib
 import threading
 from face_rec.srv import recognition_results, recognition_resultsRequest
@@ -86,15 +87,15 @@ STAGE_FINISHED = 4        # 全部完成
 
 # 语音确认关键词
 CONFIRM_KEYWORDS_TASK1 = ["去", "带我去", "参观", "带我去参观", "好的", "确认", "是"]
-CONFIRM_KEYWORDS_TASK2 = ["开始巡检", "开始执行巡检", "执行巡检", "开始检查", "好的", "确认", "是"]
+CONFIRM_KEYWORDS_TASK2 = ["巡检", "好的", "确认", "是"]
 
-# 场馆语音识别关键词映射（用户说"去北京馆"→识别为北京馆）
+# 场馆语音识别关键词映射（只说场馆名即可）
 VENUE_KEYWORDS = {
-    "北京馆": ["北京馆", "北京"],
-    "上海馆": ["上海馆", "上海"],
-    "吉林馆": ["吉林馆", "吉林"],
-    "深圳馆": ["深圳馆", "深圳"],
-    "广州馆": ["广州馆", "广州"],
+    "北京馆": ["北京馆"],
+    "上海馆": ["上海馆"],
+    "吉林馆": ["吉林馆"],
+    "深圳馆": ["深圳馆"],
+    "广州馆": ["广州馆"],
 }
 
 # 场馆中文名转拼音映射（用于构造guide/back音频文件名）
@@ -211,6 +212,25 @@ def playAudio(file_path):
             return 0
     except Exception as e:
         rospy.logwarn(f"[音频] 异常: {e}")
+        return 0
+
+
+def playAlarm():
+    """播放MP3警报声（通过ffplay异步后台播放），返回估算时长"""
+    mp3_path = os.path.join(AUDIO_DIR, "警报声.mp3")
+    if not os.path.exists(mp3_path):
+        rospy.logwarn(f"[告警] 警报文件不存在: {mp3_path}")
+        return 0
+    try:
+        subprocess.Popen(
+            ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", mp3_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        duration = os.path.getsize(mp3_path) * 8 / 128000 + 1
+        rospy.loginfo(f"[告警] 播放警报声 (~{duration:.1f}秒)")
+        return duration
+    except Exception as e:
+        rospy.logwarn(f"[告警] 播放失败: {e}")
         return 0
 
 
@@ -344,19 +364,15 @@ def clear_costmaps():
     for topic in topics:
         try:
             pub = rospy.Publisher(topic, std_msgs.msg.Empty, queue_size=1, latch=True)
-            # 发送3次确保清除成功
-            for _ in range(3):
-                pub.publish(std_msgs.msg.Empty())
-                time.sleep(0.1)
+            pub.publish(std_msgs.msg.Empty())
             cleared += 1
             rospy.loginfo(f"[清除] 已发布: {topic}")
         except Exception as e:
             rospy.logwarn(f"[清除] 失败: {topic} - {e}")
 
     if cleared > 0:
-        # 等待costmap更新（关键！给激光雷达时间重新扫描）
-        time.sleep(2)  # 增加到2秒，确保障碍物层完全刷新
-        rospy.loginfo(f"[清除] 共清除 {cleared} 个costmap层，等待2秒让雷达重新扫描")
+        time.sleep(0.5)  # 0.5秒让雷达刷新（之前2s）
+        rospy.loginfo(f"[清除] 共清除 {cleared} 个costmap层（0.5秒刷新）")
     return cleared > 0
 
 
@@ -372,12 +388,12 @@ def wait_for_path_clear(timeout_sec=10):
 
     while not rospy.is_shutdown() and (time.time() - start_time) < timeout_sec:
         clear_costmaps()
-        time.sleep(1)
-        waited += 1
-        if waited % 3 == 0:  # 每3秒打印一次
-            rospy.loginfo(f"[等待] 已等待{waited}秒，继续观察...")
+        time.sleep(0.5)  # 0.5秒间隔清除（之前1s）
+        waited += 0.5
+        if int(waited) > 0 and int(waited) % 2 == 0:
+            rospy.loginfo(f"[等待] 已等待{int(waited)}秒，继续观察...")
 
-    rospy.loginfo(f"[等待] 等待结束，共{waited}秒")
+    rospy.loginfo(f"[等待] 等待结束，共{int(waited)}秒")
     return True
 
 
@@ -414,11 +430,11 @@ def nav_to_goal(goal_name, max_retries=2):
 
         # 首次尝试时，先等待路径畅通（给障碍物时间移开）
         if attempt == 0:
-            wait_for_path_clear(timeout_sec=5)  # 等待5秒让障碍物移开
+            wait_for_path_clear(timeout_sec=3)  # 等待3秒（之前5s）
         else:
             # 重试时更长时间等待和清除
             clear_costmaps()
-            time.sleep(3)  # 多等3秒让雷达完全刷新
+            time.sleep(1)  # 等1秒让雷达刷新（之前3s）
 
         client = actionlib.SimpleActionClient('move_base', MoveBaseAction)
         rospy.loginfo(f"[导航] 等待 move_base 服务...")
@@ -452,6 +468,8 @@ def nav_to_goal(goal_name, max_retries=2):
                 success_count += 1
                 if success_count >= SUCCESS_THRESHOLD:
                     rospy.loginfo(f"[导航] ✅ 已到达 {goal_name}！（连续{success_count}次确认）")
+                    # 清除costmap残留，避免动态障碍物残留影响后续导航
+                    clear_costmaps()
                     return True
                 continue
             else:
@@ -499,8 +517,8 @@ def nav_to_goal(goal_name, max_retries=2):
             rospy.logwarn(f"[导航] 异常: {e}")
 
         if attempt < max_retries:
-            rospy.logwarn(f"[导航] 第{attempt+1}次失败，2秒后重试...")
-            time.sleep(2)
+            rospy.logwarn(f"[导航] 第{attempt+1}次失败，1秒后重试...")
+            time.sleep(1)  # 1秒后重试（之前2s）
 
     rospy.logerr(f"[导航] {max_retries+1}次尝试均失败: {goal_name}")
     return False
@@ -600,31 +618,32 @@ def yolo_check_venue(venue_name):
     """
     到达场馆后，用YOLO检测火源和灭火器。
     返回: {"fire": bool, "extinguisher": bool}
+
+    火源检测使用较高置信度避免误判，灭火器使用常规置信度
     """
     result = {"fire": False, "extinguisher": False}
+    FIRE_CONF = 0.45          # 火源检测阈值（平衡识别与误判）
+    EXTINGUISHER_CONF = 0.2   # 灭火器检测阈值（降低以提升识别率）
 
     try:
-        # 获取摄像头图像
         rospy.loginfo(f"[巡检] {venue_name} - 获取图像进行YOLO检测...")
         image_msg = rospy.wait_for_message(CAMERA_TOPIC, Image, timeout=10.0)
         frame = _cv_bridge.imgmsg_to_cv2(image_msg, desired_encoding="bgr8")
 
-        # YOLO推理
+        # YOLO推理（使用较高全局阈值后，再按类别细分）
         detections = _yolo_model(frame, conf=0.25, verbose=False)
 
-        # 分析检测结果
-        detected_classes = []
         for box in detections[0].boxes:
             cls_id = int(box.cls[0])
             cls_name = detections[0].names[cls_id]
-            conf = float(box.conf[0])
-            detected_classes.append(cls_name)
-            rospy.loginfo(f"[巡检] {venue_name} - 检测到: {cls_name} (置信度: {conf:.2f})")
+            conf_val = float(box.conf[0])
+            rospy.loginfo(f"[巡检] {venue_name} - 检测到: {cls_name} (置信度: {conf_val:.2f})")
 
-        if "fire" in detected_classes:
-            result["fire"] = True
-        if "fire_extinguisher" in detected_classes:
-            result["extinguisher"] = True
+            if cls_name == "fire" and conf_val >= FIRE_CONF:
+                result["fire"] = True
+                rospy.loginfo(f"[巡检] {venue_name} - ✅ 火源确认 (置信度{conf_val:.2f} ≥ {FIRE_CONF})")
+            elif cls_name == "fire_extinguisher" and conf_val >= EXTINGUISHER_CONF:
+                result["extinguisher"] = True
 
     except Exception as e:
         rospy.logerr(f"[巡检] {venue_name} - YOLO检测异常: {e}")
@@ -645,31 +664,43 @@ def do_patrol_venue(venue_name):
     # 2. 到达后稍作停留，让摄像头稳定
     time.sleep(3)
 
-    # 3. YOLO检测（多次检测提高准确率）
-    all_results = {"fire": False, "extinguisher": False}
-    for i in range(3):  # 检测3次取结果
-        r = yolo_check_venue(venue_name)
-        if r["fire"]:
-            all_results["fire"] = True
-        if r["extinguisher"]:
-            all_results["extinguisher"] = True
-        time.sleep(1)
+    # 3. YOLO检测（单次检测，提高整体速度）
+    r = yolo_check_venue(venue_name)
+    fire_count = 1 if r["fire"] else 0
+    extinguisher_count = 1 if r["extinguisher"] else 0
 
-    # 4. 根据检测结果播放异常音频
+    # 4. 根据检测结果播放异常音频（先播警报声，再播具体pcm）
     venue_audio = ABNORMAL_AUDIO.get(venue_name, {})
+    fire_confirmed = bool(fire_count)
+    has_abnormal = False
 
-    if all_results["fire"]:
-        rospy.logwarn(f"[巡检] {venue_name} - 发现火源！播报警告音频")
+    if fire_confirmed:
+        rospy.logwarn(f"[巡检] {venue_name} - 发现火源！")
+        has_abnormal = True
+
+    if not extinguisher_count:
+        rospy.logwarn(f"[巡检] {venue_name} - 未检测到灭火器！")
+        has_abnormal = True
+
+    # 有异常时先播放警报声
+    if has_abnormal:
+        dur = playAlarm()
+        time.sleep(dur + 0.3)
+
+    # 播放具体异常pcm
+    if fire_confirmed:
         playAudio(venue_audio.get("fire", ""))
         time.sleep(2)
-
-    if not all_results["extinguisher"]:
-        rospy.logwarn(f"[巡检] {venue_name} - 未检测到灭火器！播报提示音频")
+    if extinguisher_count == 0:
         playAudio(venue_audio.get("no_extinguisher", ""))
         time.sleep(2)
 
-    if not all_results["fire"] and all_results["extinguisher"]:
+    if not fire_confirmed and extinguisher_count > 0:
         rospy.loginfo(f"[巡检] {venue_name} - 检查正常（无火源、有灭火器）")
+    elif not fire_confirmed and extinguisher_count == 0:
+        rospy.loginfo(f"[巡检] {venue_name} - 无火源但缺少灭火器")
+    else:
+        rospy.loginfo(f"[巡检] {venue_name} - 发现火源")
 
     rospy.loginfo(f"[巡检] ====== {venue_name} 检查完成 ======")
 
